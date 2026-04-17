@@ -10,7 +10,7 @@ function getMedian(arr: number[]) {
 export async function getTraceDetails() {
   try {
     const [ipRes, traceRes] = await Promise.all([
-      fetch('https://get.geojs.io/v1/ip/geo.json', { cache: 'no-store' }),
+      fetch('https://ipinfo.io/json', { cache: 'no-store' }),
       fetch('https://speed.cloudflare.com/cdn-cgi/trace', { cache: 'no-store' })
     ]);
     
@@ -22,7 +22,7 @@ export async function getTraceDetails() {
     const coloMatch = traceText.match(/colo=([A-Z]+)/);
     const colo = coloMatch ? coloMatch[1] : null;
     
-    let serverNode = data.organization || data.organization_name || "Cloudflare Anycast";
+    let serverNode = data.org || "Cloudflare Anycast";
     if (colo === 'BOM') serverNode = 'Mumbai Node (Cloudflare Edge)';
     if (colo === 'MAA') serverNode = 'Chennai Node (Cloudflare Edge)';
     if (colo === 'BLR') serverNode = 'Bangalore Node (Cloudflare Edge)';
@@ -37,11 +37,17 @@ export async function getTraceDetails() {
     };
   } catch (e) {
     try {
-      const fb = await fetch('https://api.ipify.org?format=json');
+      const fb = await fetch('https://get.geojs.io/v1/ip/geo.json');
       const data = await fb.json();
-      return { ip: data.ip || "Detecting...", city: "Remote", region: "Network", isp: "Cloudflare Routing" };
+      return { 
+          ip: data.ip || "Detecting...", 
+          city: data.city || "Remote", 
+          region: data.region || "Network", 
+          isp: data.organization || "Cloudflare Routing",
+          country: data.country || "Unknown"
+      };
     } catch {
-      return { ip: "Unknown IP", city: "Local", region: "Network", isp: "Unknown Provider" };
+      return { ip: "Unknown IP", city: "Local", region: "Network", isp: "Unknown Provider", country: "Global" };
     }
   }
 }
@@ -110,26 +116,30 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
       clearInterval(monitorInterval);
       clearInterval(pingInterval);
       
-      const trimmedHistory = history.slice(20); // strict 2.0s warmup trim
-      const finalSpeed = trimmedHistory.length > 0 ? getMedian(trimmedHistory) : history[history.length - 1] || 0;
+      const finalSpeed = history.length > 0 ? history[history.length - 1] : 0;
       const finalLoadedPing = pings.length > 0 ? getMedian(pings) : 0;
       
       resolve({ mbps: finalSpeed, loadedPing: Math.round(finalLoadedPing) });
     };
 
-    let prevLoaded = 0;
+    let warmupBytes = 0;
     const monitorInterval = setInterval(() => {
       const now = performance.now();
-      const diffBytes = totalLoaded - prevLoaded;
-      prevLoaded = totalLoaded;
-
-      const instantMbps = (diffBytes * 8) / (0.1 * 1000000);
-      history.push(instantMbps);
-
-      const displaySmooth = getMedian(history.slice(-4)); 
       const elapsed = now - startTime;
-      
-      onProgress(displaySmooth, Math.min((elapsed / DOWNLOAD_DURATION) * 100, 100));
+
+      if (elapsed < 1000) {
+          warmupBytes = totalLoaded;
+          const instantMbps = totalLoaded > 0 ? (totalLoaded * 8) / (elapsed * 1000) : 0;
+          history.push(instantMbps);
+          onProgress(instantMbps, Math.min((elapsed / DOWNLOAD_DURATION) * 100, 100));
+      } else {
+          // Sustained bandwidth math natively resolves micro-jitters
+          const sustainedElapsed = elapsed - 1000;
+          const sustainedBytes = totalLoaded - warmupBytes;
+          const sustainedMbps = sustainedBytes > 0 ? (sustainedBytes * 8) / (sustainedElapsed * 1000) : 0;
+          history.push(sustainedMbps);
+          onProgress(sustainedMbps, Math.min((elapsed / DOWNLOAD_DURATION) * 100, 100));
+      }
 
       if (elapsed > DOWNLOAD_DURATION) {
          shutDown();
@@ -160,23 +170,22 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
   });
 }
 
-// Rewritten upload logic using Fetch blob looping to bypass opaque CORS constraints
+// Rewritten upload logic using raw XHR physical stream buffers
 export function measureUpload(onProgress: (mbps: number, progress: number, errorState?: string) => void): Promise<{ mbps: number, loadedPing: number }> {
     return new Promise((resolve) => {
-      const WORKER_COUNT = 6;
-      const CHUNK_SIZE = 1 * 1024 * 1024; // 1MB blob
+      const WORKER_COUNT = 4;
+      const CHUNK_SIZE = 25 * 1024 * 1024; // 25MB blob continuous stream
       const buffer = new Uint8Array(CHUNK_SIZE);
-      const blob = new Blob([buffer], { type: 'text/plain' }); // Using text/plain is the true Ookla/Cloudflare trick to bypass CORS OPTIONS preflight
+      const blob = new Blob([buffer], { type: 'text/plain' }); 
       
       let totalLoaded = 0;
       let activeWorkers = 0;
       let isDone = false;
-      let consecutiveErrors = 0;
-      let usingAlternate = false;
       const history: number[] = [];
       const pings: number[] = [];
       const startTime = performance.now();
-      const UPLOAD_DURATION = 8000; // Run upload stress for 8 seconds minimum
+      const UPLOAD_DURATION = 8000; 
+      let warmupBytes = 0;
 
       let pingInterval = setInterval(async () => {
         const pStart = performance.now();
@@ -192,55 +201,59 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
         clearInterval(monitorInterval);
         clearInterval(pingInterval);
         
-        // 10 chunks * 100ms = 1.0s strict warmup rejection
-        const trimmedHistory = history.slice(10); 
-        const finalSpeed = trimmedHistory.length > 0 ? getMedian(trimmedHistory) : history[history.length - 1] || 0;
+        const finalSpeed = history.length > 0 ? history[history.length - 1] : 0;
         const finalLoadedPing = pings.length > 0 ? getMedian(pings) : 0;
         
         resolve({ mbps: finalSpeed, loadedPing: Math.round(finalLoadedPing) });
       };
 
-      let prevLoaded = 0;
       const monitorInterval = setInterval(() => {
         const now = performance.now();
-        const diffBytes = totalLoaded - prevLoaded;
-        prevLoaded = totalLoaded;
-  
-        const instantMbps = (diffBytes * 8) / (0.1 * 1000000);
-        history.push(instantMbps);
-  
-        const displaySmooth = getMedian(history.slice(-4)); 
         const elapsed = now - startTime;
         
-        onProgress(displaySmooth, Math.min((elapsed / UPLOAD_DURATION) * 100, 100), usingAlternate ? "Measurement confidence: Moderate" : undefined);
-
+        if (elapsed < 1000) {
+            warmupBytes = totalLoaded;
+            const instantMbps = totalLoaded > 0 ? (totalLoaded * 8) / (elapsed * 1000) : 0;
+            history.push(instantMbps);
+            onProgress(instantMbps, Math.min((elapsed / UPLOAD_DURATION) * 100, 100));
+        } else {
+            const sustainedElapsed = elapsed - 1000;
+            const sustainedBytes = totalLoaded - warmupBytes;
+            const sustainedMbps = sustainedBytes > 0 ? (sustainedBytes * 8) / (sustainedElapsed * 1000) : 0;
+            history.push(sustainedMbps);
+            onProgress(sustainedMbps, Math.min((elapsed / UPLOAD_DURATION) * 100, 100));
+        }
+  
         if (elapsed > UPLOAD_DURATION) {
            shutDown();
         }
       }, 100);
   
-      // Workers loop recursively until time is up, counting bytes STRICTLY on HTTP receipt success
       for(let i=0; i<WORKER_COUNT; i++) {
         activeWorkers++;
-        const pumper = async () => {
-            while(!isDone) {
-                try {
-                    // Use Same-Origin Next.js Serverless API Endpoint
-                    // Completely bypasses CORS and Adblockers, ensuring mathematical accuracy
-                    const targetUrl = '/api/speedtest/upload';
-
-                    await fetch(targetUrl, {
-                        method: 'POST',
-                        body: blob,
-                        cache: 'no-store',
-                    });
-                    
-                    if (!isDone) totalLoaded += CHUNK_SIZE;
-                } catch {
-                    // If Vercel temporarily 429s or connection drops, worker dynamically loops without crashing
-                }
+        const pumper = () => {
+            if (isDone) {
+                activeWorkers--;
+                return;
             }
-            activeWorkers--;
+            const xhr = new XMLHttpRequest();
+            let previousLoaded = 0;
+            
+            xhr.upload.onprogress = (e) => {
+                if (isDone) return;
+                const diff = e.loaded - previousLoaded;
+                previousLoaded = e.loaded;
+                totalLoaded += diff;
+            };
+            
+            xhr.onloadend = () => {
+                pumper();
+            };
+            
+            // XHR Simple Request bypasses strict OPTIONS preflights globally
+            xhr.open("POST", "https://speed.cloudflare.com/__up", true);
+            xhr.setRequestHeader("Content-Type", "text/plain");
+            xhr.send(blob);
         };
         pumper();
       }
