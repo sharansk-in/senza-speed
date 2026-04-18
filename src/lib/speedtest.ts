@@ -7,32 +7,61 @@ function getMedian(arr: number[]) {
   return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+const LIBRESPEED_SERVERS = [
+  { name: "Singapore (Salvatore Cahyo)", url: "https://speedtest.dsgroupmedia.com/backend" },
+  { name: "Frankfurt (Clouvider)", url: "https://fra.speedtest.clouvider.net/backend" },
+  { name: "London (Clouvider)", url: "https://lon.speedtest.clouvider.net/backend" },
+  { name: "Los Angeles (Clouvider)", url: "https://la.speedtest.clouvider.net/backend" },
+  { name: "New York (Clouvider)", url: "https://nyc.speedtest.clouvider.net/backend" }
+];
+
+let activeServer: { name: string, url: string } | null = null;
+
+export async function fetchNearestServer() {
+  if (activeServer) return activeServer;
+  
+  let bestServer = LIBRESPEED_SERVERS[0];
+  let bestPing = Infinity;
+
+  // Race all public LibreSpeed backends to find closest node
+  const tests = LIBRESPEED_SERVERS.map(async (server) => {
+    try {
+      const start = performance.now();
+      await fetch(server.url + '/empty.php', { method: 'HEAD', mode: 'cors', cache: 'no-store' });
+      const ping = performance.now() - start;
+      if (ping < bestPing) {
+        bestPing = ping;
+        bestServer = server;
+      }
+    } catch (e) {}
+  });
+
+  await Promise.allSettled(tests);
+  activeServer = bestServer;
+  return activeServer;
+}
+
+
 export async function getTraceDetails() {
   try {
-    const [ipRes, traceRes] = await Promise.all([
+    const nearest = await fetchNearestServer();
+    
+    // Explicit chained IP sourcing
+    const [ipRes] = await Promise.all([
       fetch('https://ipinfo.io/json', { cache: 'no-store' }),
-      fetch('https://speed.cloudflare.com/cdn-cgi/trace', { cache: 'no-store' })
     ]);
     
-    const [data, traceText] = await Promise.all([
-      ipRes.json(),
-      traceRes.text()
+    const [data] = await Promise.all([
+      ipRes.json()
     ]);
 
-    const coloMatch = traceText.match(/colo=([A-Z]+)/);
-    const colo = coloMatch ? coloMatch[1] : null;
-    
-    let serverNode = data.org || "Cloudflare Anycast";
-    if (colo === 'BOM') serverNode = 'Mumbai Node (Cloudflare Edge)';
-    if (colo === 'MAA') serverNode = 'Chennai Node (Cloudflare Edge)';
-    if (colo === 'BLR') serverNode = 'Bangalore Node (Cloudflare Edge)';
-    if (colo === 'DEL' || colo === 'NAG') serverNode = 'New Delhi Node (Cloudflare Edge)';
+    let provider = data.org || "Network Provider";
 
     return {
       ip: data.ip,
       city: data.city || "Unknown City",
       region: data.region || "Unknown Region",
-      isp: serverNode,
+      isp: `${nearest.name} | ${provider}`,
       country: data.country || "Unknown Country"
     };
   } catch (e) {
@@ -43,7 +72,7 @@ export async function getTraceDetails() {
           ip: data.ip || "Detecting...", 
           city: data.city || "Remote", 
           region: data.region || "Network", 
-          isp: data.organization || "Cloudflare Routing",
+          isp: data.organization || "LibreSpeed Target",
           country: data.country || "Unknown"
       };
     } catch {
@@ -55,11 +84,12 @@ export async function getTraceDetails() {
 export async function measurePing(iterations: number = 10): Promise<{ping: number, jitter: number, loss: number}> {
   const latencies: number[] = [];
   let failures = 0;
+  const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
 
   for (let i = 0; i < iterations; i++) {
     const start = performance.now();
     try {
-      const res = await fetch(`https://speed.cloudflare.com/cdn-cgi/trace?t=${Date.now()}${i}`, { cache: 'no-store' });
+      const res = await fetch(`${targetUrl}/empty.php?t=${Date.now()}${i}`, { cache: 'no-store' });
       const end = performance.now();
       if (res.ok) {
         latencies.push(end - start);
@@ -90,11 +120,12 @@ export async function measurePing(iterations: number = 10): Promise<{ping: numbe
 
 export function measureDownload(onProgress: (mbps: number, progress: number) => void): Promise<{ mbps: number, loadedPing: number }> {
   return new Promise((resolve) => {
-    const WORKER_COUNT = 8;
-    const CHUNK_SIZE = 25000000; // 25MB recursive chunks 
+    const WORKER_COUNT = 6;
+    const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
+    
     let totalLoaded = 0;
     const startTime = performance.now();
-    const DOWNLOAD_DURATION = 8000; // 8 seconds minimum duration
+    const DOWNLOAD_DURATION = 8000; 
     
     let activeWorkers = 0;
     let isDone = false;
@@ -105,7 +136,7 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
     let pingInterval = setInterval(async () => {
       const pStart = performance.now();
       try {
-        await fetch(`https://speed.cloudflare.com/cdn-cgi/trace?loaded=${Date.now()}`, { cache: 'no-store' });
+        await fetch(`${targetUrl}/empty.php?loaded=${Date.now()}`, { cache: 'no-store' });
         pings.push(performance.now() - pStart);
       } catch (e) {}
     }, 500);
@@ -133,7 +164,6 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
           history.push(instantMbps);
           onProgress(instantMbps, Math.min((elapsed / DOWNLOAD_DURATION) * 100, 100));
       } else {
-          // Sustained bandwidth math natively resolves micro-jitters
           const sustainedElapsed = elapsed - 1000;
           const sustainedBytes = totalLoaded - warmupBytes;
           const sustainedMbps = sustainedBytes > 0 ? (sustainedBytes * 8) / (sustainedElapsed * 1000) : 0;
@@ -151,7 +181,8 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
         const puller = async () => {
             while (!isDone) {
                 try {
-                    const res = await fetch(`https://speed.cloudflare.com/__down?bytes=${CHUNK_SIZE}`, { cache: 'no-store' });
+                    // LibreSpeed specific garbage data endpoint generating up to 100MB chunks natively
+                    const res = await fetch(`${targetUrl}/garbage.php?ckSize=100`, { cache: 'no-store' });
                     if (!res.body) break;
                     const reader = res.body.getReader();
                     while (!isDone) {
@@ -160,7 +191,7 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
                         if (done) break;
                     }
                 } catch {
-                    // transient error
+                    // transient error handling natively loops
                 }
             }
             activeWorkers--;
@@ -170,13 +201,14 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
   });
 }
 
-// Rewritten upload logic using raw XHR physical stream buffers
+// XHR Physical stream buffers actively target LibreSpeed Open CORS Backend
 export function measureUpload(onProgress: (mbps: number, progress: number, errorState?: string) => void): Promise<{ mbps: number, loadedPing: number }> {
     return new Promise((resolve) => {
       const WORKER_COUNT = 4;
       const CHUNK_SIZE = 25 * 1024 * 1024; // 25MB blob continuous stream
       const buffer = new Uint8Array(CHUNK_SIZE);
-      const blob = new Blob([buffer], { type: 'text/plain' }); 
+      const blob = new Blob([buffer], { type: 'application/octet-stream' }); 
+      const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
       
       let totalLoaded = 0;
       let activeWorkers = 0;
@@ -190,7 +222,7 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
       let pingInterval = setInterval(async () => {
         const pStart = performance.now();
         try {
-          await fetch(`https://speed.cloudflare.com/cdn-cgi/trace?loadedup=${Date.now()}`, { cache: 'no-store' });
+          await fetch(`${targetUrl}/empty.php?loadedup=${Date.now()}`, { cache: 'no-store' });
           pings.push(performance.now() - pStart);
         } catch (e) {}
       }, 500);
@@ -247,12 +279,12 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
             };
             
             xhr.onloadend = () => {
-                pumper();
+                pumper(); // Recursively pump the stream
             };
             
-            // XHR Simple Request bypasses strict OPTIONS preflights globally
-            xhr.open("POST", "https://speed.cloudflare.com/__up", true);
-            xhr.setRequestHeader("Content-Type", "text/plain");
+            // XHR Request natively hits Open-Source LibreSpeed Endpoint guaranteed to resolve
+            xhr.open("POST", `${targetUrl}/empty.php`, true);
+            xhr.setRequestHeader("Content-Type", "application/octet-stream");
             xhr.send(blob);
         };
         pumper();
