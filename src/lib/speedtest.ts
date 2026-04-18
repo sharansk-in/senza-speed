@@ -7,12 +7,10 @@ function getMedian(arr: number[]) {
   return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-const LIBRESPEED_SERVERS = [
-  { name: "Singapore (Salvatore Cahyo)", url: "https://speedtest.dsgroupmedia.com/backend" },
-  { name: "Frankfurt (Clouvider)", url: "https://fra.speedtest.clouvider.net/backend" },
-  { name: "London (Clouvider)", url: "https://lon.speedtest.clouvider.net/backend" },
-  { name: "Los Angeles (Clouvider)", url: "https://la.speedtest.clouvider.net/backend" },
-  { name: "New York (Clouvider)", url: "https://nyc.speedtest.clouvider.net/backend" }
+const DEFAULT_SERVERS = [
+  { name: "Asia / India Node (LibreSpeed)", url: "https://speedtest.dsgroupmedia.com/backend" },
+  { name: "EU Node (LibreSpeed)", url: "https://de4.backend.librespeed.org" },
+  { name: "Global Fallback (LibreSpeed)", url: "https://la.speedtest.clouvider.net/backend" }
 ];
 
 let activeServer: { name: string, url: string } | null = null;
@@ -20,33 +18,31 @@ let activeServer: { name: string, url: string } | null = null;
 export async function fetchNearestServer() {
   if (activeServer) return activeServer;
   
-  let bestServer = LIBRESPEED_SERVERS[0];
-  let bestPing = Infinity;
+  if (process.env.NEXT_PUBLIC_SPEEDTEST_URL) {
+     activeServer = { name: "Dedicated VPS Node", url: process.env.NEXT_PUBLIC_SPEEDTEST_URL };
+     return activeServer;
+  }
 
-  // Race all public LibreSpeed backends to find closest node
-  const tests = LIBRESPEED_SERVERS.map(async (server) => {
-    try {
-      const start = performance.now();
-      await fetch(server.url + '/empty.php', { method: 'HEAD', mode: 'cors', cache: 'no-store' });
-      const ping = performance.now() - start;
-      if (ping < bestPing) {
-        bestPing = ping;
-        bestServer = server;
-      }
-    } catch (e) {}
-  });
-
-  await Promise.allSettled(tests);
-  activeServer = bestServer;
-  return activeServer;
+  for (const server of DEFAULT_SERVERS) {
+     try {
+         const controller = new AbortController();
+         const timeoutId = setTimeout(() => controller.abort(), 2000);
+         const res = await fetch(`${server.url}/empty.php`, { method: 'HEAD', mode: 'cors', cache: 'no-store', signal: controller.signal });
+         clearTimeout(timeoutId);
+         if (res.ok) {
+             activeServer = server;
+             return activeServer;
+         }
+     } catch (e) {}
+  }
+  
+  throw new Error("No backend nodes reachable. Connection blocked.");
 }
-
 
 export async function getTraceDetails() {
   try {
     const nearest = await fetchNearestServer();
     
-    // Explicit chained IP sourcing
     const [ipRes] = await Promise.all([
       fetch('https://ipinfo.io/json', { cache: 'no-store' }),
     ]);
@@ -64,7 +60,9 @@ export async function getTraceDetails() {
       isp: `${nearest.name} | ${provider}`,
       country: data.country || "Unknown Country"
     };
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message.includes("reachable")) throw e; // Forward hard connection failures
+
     try {
       const fb = await fetch('https://get.geojs.io/v1/ip/geo.json');
       const data = await fb.json();
@@ -72,7 +70,7 @@ export async function getTraceDetails() {
           ip: data.ip || "Detecting...", 
           city: data.city || "Remote", 
           region: data.region || "Network", 
-          isp: data.organization || "LibreSpeed Target",
+          isp: activeServer?.name || "Target Node",
           country: data.country || "Unknown"
       };
     } catch {
@@ -84,12 +82,17 @@ export async function getTraceDetails() {
 export async function measurePing(iterations: number = 10): Promise<{ping: number, jitter: number, loss: number}> {
   const latencies: number[] = [];
   let failures = 0;
-  const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
+  
+  const targetUrl = activeServer ? activeServer.url : DEFAULT_SERVERS[0].url;
 
   for (let i = 0; i < iterations; i++) {
     const start = performance.now();
     try {
-      const res = await fetch(`${targetUrl}/empty.php?t=${Date.now()}${i}`, { cache: 'no-store' });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1500);
+      const res = await fetch(`${targetUrl}/empty.php?t=${Date.now()}${i}`, { cache: 'no-store', signal: controller.signal });
+      clearTimeout(timeoutId);
+
       const end = performance.now();
       if (res.ok) {
         latencies.push(end - start);
@@ -102,6 +105,8 @@ export async function measurePing(iterations: number = 10): Promise<{ping: numbe
   }
 
   const loss = (failures / iterations) * 100;
+  if (loss === 100) throw new Error("Ping failed completely."); // Hard reject on 100% loss
+
   if (latencies.length === 0) return { ping: 0, jitter: 0, loss };
 
   const ping = getMedian(latencies);
@@ -119,9 +124,9 @@ export async function measurePing(iterations: number = 10): Promise<{ping: numbe
 }
 
 export function measureDownload(onProgress: (mbps: number, progress: number) => void): Promise<{ mbps: number, loadedPing: number }> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const WORKER_COUNT = 6;
-    const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
+    const targetUrl = activeServer ? activeServer.url : DEFAULT_SERVERS[0].url;
     
     let totalLoaded = 0;
     const startTime = performance.now();
@@ -129,9 +134,18 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
     
     let activeWorkers = 0;
     let isDone = false;
+    let globalErrorCount = 0;
     
     const history: number[] = [];
     const pings: number[] = [];
+
+    // Hard 12-second timeout payload constraint
+    const hardTimeout = setTimeout(() => {
+        if (!isDone) {
+            shutDown();
+            reject(new Error("Download stream hard timeout exceeded."));
+        }
+    }, 12000);
 
     let pingInterval = setInterval(async () => {
       const pStart = performance.now();
@@ -146,6 +160,7 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
       isDone = true;
       clearInterval(monitorInterval);
       clearInterval(pingInterval);
+      clearTimeout(hardTimeout);
       
       const finalSpeed = history.length > 0 ? history[history.length - 1] : 0;
       const finalLoadedPing = pings.length > 0 ? getMedian(pings) : 0;
@@ -157,6 +172,11 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
     const monitorInterval = setInterval(() => {
       const now = performance.now();
       const elapsed = now - startTime;
+
+      if (globalErrorCount > 30) {
+          shutDown();
+          reject(new Error("Connection reset by peer repeatedly."));
+      }
 
       if (elapsed < 1000) {
           warmupBytes = totalLoaded;
@@ -181,7 +201,6 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
         const puller = async () => {
             while (!isDone) {
                 try {
-                    // LibreSpeed specific garbage data endpoint generating up to 100MB chunks natively
                     const res = await fetch(`${targetUrl}/garbage.php?ckSize=100`, { cache: 'no-store' });
                     if (!res.body) break;
                     const reader = res.body.getReader();
@@ -191,7 +210,7 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
                         if (done) break;
                     }
                 } catch {
-                    // transient error handling natively loops
+                    globalErrorCount++;
                 }
             }
             activeWorkers--;
@@ -201,23 +220,33 @@ export function measureDownload(onProgress: (mbps: number, progress: number) => 
   });
 }
 
-// XHR Physical stream buffers actively target LibreSpeed Open CORS Backend
+// XHR Physical stream buffers actively target Dedicated Open CORS Backend
 export function measureUpload(onProgress: (mbps: number, progress: number, errorState?: string) => void): Promise<{ mbps: number, loadedPing: number }> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const WORKER_COUNT = 4;
       const CHUNK_SIZE = 25 * 1024 * 1024; // 25MB blob continuous stream
       const buffer = new Uint8Array(CHUNK_SIZE);
       const blob = new Blob([buffer], { type: 'application/octet-stream' }); 
-      const targetUrl = activeServer ? activeServer.url : LIBRESPEED_SERVERS[0].url;
+      const targetUrl = activeServer ? activeServer.url : DEFAULT_SERVERS[0].url;
       
       let totalLoaded = 0;
       let activeWorkers = 0;
       let isDone = false;
+      let globalErrorCount = 0;
+
       const history: number[] = [];
       const pings: number[] = [];
       const startTime = performance.now();
       const UPLOAD_DURATION = 8000; 
       let warmupBytes = 0;
+
+      // Hard 12-second timeout array
+      const hardTimeout = setTimeout(() => {
+        if (!isDone) {
+            shutDown();
+            reject(new Error("Upload stream hard timeout exceeded."));
+        }
+      }, 12000);
 
       let pingInterval = setInterval(async () => {
         const pStart = performance.now();
@@ -232,6 +261,7 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
         isDone = true;
         clearInterval(monitorInterval);
         clearInterval(pingInterval);
+        clearTimeout(hardTimeout);
         
         const finalSpeed = history.length > 0 ? history[history.length - 1] : 0;
         const finalLoadedPing = pings.length > 0 ? getMedian(pings) : 0;
@@ -243,6 +273,11 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
         const now = performance.now();
         const elapsed = now - startTime;
         
+        if (globalErrorCount > 30) {
+            shutDown();
+            reject(new Error("Upload endpoints violently blocked."));
+        }
+
         if (elapsed < 1000) {
             warmupBytes = totalLoaded;
             const instantMbps = totalLoaded > 0 ? (totalLoaded * 8) / (elapsed * 1000) : 0;
@@ -279,10 +314,14 @@ export function measureUpload(onProgress: (mbps: number, progress: number, error
             };
             
             xhr.onloadend = () => {
-                pumper(); // Recursively pump the stream
+                pumper(); 
+            };
+
+            xhr.onerror = () => {
+                globalErrorCount++;
+                pumper();
             };
             
-            // XHR Request natively hits Open-Source LibreSpeed Endpoint guaranteed to resolve
             xhr.open("POST", `${targetUrl}/empty.php`, true);
             xhr.setRequestHeader("Content-Type", "application/octet-stream");
             xhr.send(blob);

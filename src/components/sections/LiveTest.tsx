@@ -11,7 +11,7 @@ interface LiveTestProps {
 }
 
 export function LiveTest({ onComplete }: LiveTestProps) {
-  const [stage, setStage] = React.useState<"ping" | "download" | "upload" | "done">("ping");
+  const [stage, setStage] = React.useState<"ping" | "download" | "upload" | "done" | "error">("ping");
   const [progress, setProgress] = React.useState(0);
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
   const [stats, setStats] = React.useState({ jitter: 0, loss: 0, loadedPing: 0, trace: null as any });
@@ -28,71 +28,79 @@ export function LiveTest({ onComplete }: LiveTestProps) {
     let isActive = true;
     
     const runTestSequence = async () => {
-      // 1. Idle Ping Phase
-      setStage("ping");
-      setProgress(5);
-      
-      const [pingResult, trace] = await Promise.all([
-        measurePing(15),
-        getTraceDetails()
-      ]);
-      if (!isActive) return;
-      
-      pingValue.set(pingResult.ping);
-      setStats(s => ({ ...s, jitter: pingResult.jitter, loss: pingResult.loss, trace }));
-      setProgress(25);
+      try {
+        // 1. Idle Ping Phase
+        setStage("ping");
+        setProgress(5);
+        setErrorMsg(null);
+        
+        const [pingResult, trace] = await Promise.all([
+          measurePing(15),
+          getTraceDetails()
+        ]);
+        if (!isActive) return;
+        
+        pingValue.set(pingResult.ping);
+        setStats(s => ({ ...s, jitter: pingResult.jitter, loss: pingResult.loss, trace }));
+        setProgress(25);
 
-      await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 500));
 
-      // 2. Download Phase
-      if (!isActive) return;
-      setStage("download");
-      
-      const downloadResult = await measureDownload((mbps, prog) => {
-        if (isActive) {
-           downloadValue.set(mbps);
-           setProgress(25 + (prog * 0.4)); // Download is 40% of the bar
-        }
-      });
-      
-      if (!isActive) return;
-      downloadValue.set(downloadResult.mbps);
-      setStats(s => ({ ...s, loadedPing: downloadResult.loadedPing }));
-      setProgress(65);
-      
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      // 3. Upload Phase
-      if (!isActive) return;
-      setStage("upload");
-      
-      const uploadResult = await measureUpload((mbps, prog, errState) => {
-        if (isActive) {
-           uploadValue.set(mbps);
-           setProgress(65 + (prog * 0.35)); // Upload is 35% of the bar
-           if (errState) setErrorMsg(errState);
-        }
-      });
-      
-      if (!isActive) return;
-      uploadValue.set(uploadResult.mbps);
-      setStats(s => ({ ...s, loadedPing: Math.round((s.loadedPing + uploadResult.loadedPing) / 2) }));
-      setProgress(100);
-
-      // 4. Done
-      setStage("done");
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      if (isActive) {
-        onComplete({
-          download: downloadResult.mbps,
-          upload: uploadResult.mbps,
-          ping: pingResult.ping,
-          jitter: pingResult.jitter,
-          loss: pingResult.loss,
-          loadedPing: Math.max(pingResult.ping, Math.round((downloadResult.loadedPing + uploadResult.loadedPing) / 2)),
-          trace: stats.trace
+        // 2. Download Phase
+        if (!isActive) return;
+        setStage("download");
+        
+        const downloadResult = await measureDownload((mbps, prog) => {
+          if (isActive) {
+             downloadValue.set(mbps);
+             setProgress(25 + (prog * 0.4)); // Download is 40% of the bar
+          }
         });
+        
+        if (!isActive) return;
+        downloadValue.set(downloadResult.mbps);
+        setStats(s => ({ ...s, loadedPing: downloadResult.loadedPing }));
+        setProgress(65);
+        
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // 3. Upload Phase
+        if (!isActive) return;
+        setStage("upload");
+        
+        const uploadResult = await measureUpload((mbps, prog, errState) => {
+          if (isActive) {
+             uploadValue.set(mbps);
+             setProgress(65 + (prog * 0.35)); // Upload is 35% of the bar
+             if (errState) setErrorMsg(errState);
+          }
+        });
+        
+        if (!isActive) return;
+        uploadValue.set(uploadResult.mbps);
+        setStats(s => ({ ...s, loadedPing: Math.round((s.loadedPing + uploadResult.loadedPing) / 2) }));
+        setProgress(100);
+
+        // 4. Done
+        setStage("done");
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        if (isActive) {
+          onComplete({
+            download: downloadResult.mbps,
+            upload: uploadResult.mbps,
+            ping: pingResult.ping,
+            jitter: pingResult.jitter,
+            loss: pingResult.loss,
+            loadedPing: Math.max(pingResult.ping, Math.round((downloadResult.loadedPing + uploadResult.loadedPing) / 2)),
+            trace: stats.trace
+          });
+        }
+      } catch (err) {
+        if (!isActive) return;
+        setStage("error");
+        setErrorMsg("Test Failed. Connection lost or proxy blocked the route.");
+        setProgress(0);
       }
     };
 
@@ -129,6 +137,17 @@ export function LiveTest({ onComplete }: LiveTestProps) {
           </motion.div>
           
           <div className="flex justify-center items-end gap-4 h-32">
+            {stage === "error" && (
+              <motion.div className="flex flex-col items-center">
+                <span className="text-sm font-medium opacity-50 mb-6 text-red-400">CONNECTION TIMEOUT</span>
+                <button 
+                  onClick={() => window.location.reload()}
+                  className="px-8 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 font-bold tracking-tight text-white transition-all shadow-[0_0_20px_rgba(37,99,235,0.4)]"
+                >
+                  Test Failed – Retry
+                </button>
+              </motion.div>
+            )}
             {stage === "ping" && (
               <motion.div className="flex flex-col items-center">
                 <span className="text-sm font-medium opacity-50 mb-2">IDLE PING (ms)</span>
@@ -149,7 +168,7 @@ export function LiveTest({ onComplete }: LiveTestProps) {
             )}
           </div>
           
-          {errorMsg && (
+          {errorMsg && stage !== "error" && (
             <motion.div 
                initial={{ opacity: 0, y: 10 }}
                animate={{ opacity: 1, y: 0 }}
